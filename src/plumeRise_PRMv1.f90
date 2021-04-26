@@ -164,11 +164,6 @@ MODULE plume_rise_PRMv1
       !       All dump files are now in a single file uDump, all contrlled by ifStoreDump
       !       uDump - the main dump file, many variables and time steps
     
-      !if (ifStoreDump) then
-      !  open(unit=1000,file='massConservation.txt')
-      !  open(unit=1004,file='massConservation_sc.txt')
-      !  open(unit=1002,file='eflux.txt')
-      !endif
 
 
       !
@@ -244,6 +239,11 @@ MODULE plume_rise_PRMv1
       itime = 1
       stationary = .FALSE.
 
+      if (ifStoreDump) then
+        open(unit=1000,file='massConservation.txt')
+        open(unit=1004,file='massConservation_sc.txt')
+        open(unit=1002,file='eflux.txt')
+      endif
       ! ******************* model evolution ******************************
       !
       mass_in_plume_mdt = 0.
@@ -607,7 +607,7 @@ MODULE plume_rise_PRMv1
         
               print*, '---'
           endif
-           !if (ifStoreDump) write(1000,'(5(3x,d20.10))') time,mass_ejected_int,mass_in_plume,mass_detrained_int,mass_entrained_int
+           if (ifStoreDump) write(1000,'(5(3x,d20.10))') time,mass_ejected_int,mass_in_plume,mass_detrained_int,mass_entrained_int
            if (ifStoreDump) write(1000,*) time,mass_ejected_int,mass_in_plume,mass_detrained_int,mass_entrained_int
            if (ifStoreDump) write(1004,*) time,mass_ejected_int_sc,mass_in_plume_sc,mass_detrained_int_sc
 

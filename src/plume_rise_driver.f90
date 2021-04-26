@@ -21,7 +21,7 @@ module plume_rise_driver
 
   ! Public subrojtines from this module
   public compute_plume_rise
-  
+
   ! private subroutines of this module
   private fu_index
   private extract_meteo_data
@@ -116,7 +116,7 @@ CONTAINS
     ! Local variables
     real, dimension(:,:,:), allocatable :: meteo4fires_column  ! (nLevels, nQuantities, nFires)
     real, dimension(:,:), allocatable :: meteo4fires_sfc       ! (nQuantities, nFires)
-    integer :: iABL, iBVFreq, iFire, uDump=50, iThread
+    integer :: iABL, iBVFreq, iFire, uDump, iThread
     character(len=5) :: str5
     !
     ! First of all, get the data for the fire locations
@@ -139,6 +139,7 @@ CONTAINS
     !$ iThread = OMP_GET_THREAD_NUM()
     write(str5,fmt='(i5)')iThread
     str5 = adjustl(str5)
+    uDump = 50 + iThread 
 
     open(uDump, file=chDumpTemplate // trim(str5))
     
@@ -595,7 +596,7 @@ CONTAINS
         local_vapour2= 10.**local_vapour2 - 1.
 
         water_vapour = 10.79574*(1.0 - local_temperature3) - 5.0280 &
-	                 & *(LOG10(local_temperature2))
+                  & *(LOG10(local_temperature2))
         water_vapour=water_vapour + 1.50475E-4*local_vapour1 + 0.42873E-3 *local_vapour2
 
         fu_satur_water_vapour_kPa = 0.1 * 10.**(water_vapour + 0.78614)  ! in kPa
