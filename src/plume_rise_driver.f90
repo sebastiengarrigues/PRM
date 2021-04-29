@@ -12,6 +12,7 @@ module plume_rise_driver
   use plume_rise_IS4FIRES
   use plume_rise_PRMv1
   use rconstants
+  use eccodes
 
   !$ use omp_lib
   
@@ -22,19 +23,27 @@ module plume_rise_driver
   ! Public subrojtines from this module
   public compute_plume_rise
 
+  public acquire_fires
+  public acquire_meteo
+  
   ! private subroutines of this module
   private fu_index
-  private extract_meteo_data
   
   ! Public constants from this module
-  character(len=20), parameter, public :: chABL_qName = 'ABL_height'
-  character(len=20), parameter, public :: chBruntVaisalaFreq_qName = 'Brunt_Vaisala_freq'
-  character(len=20), parameter, public :: chU_wind = 'u'
-  character(len=20), parameter, public :: chV_wind = 'v'
-  character(len=20), parameter, public :: chTempr = 't'
-  character(len=20), parameter, public :: chTheta = 'theta'
-  character(len=20), parameter, public :: chPressure = 'p'
-  character(len=20), parameter, public :: chUhmidity = 'q'  
+
+  ! GRIB short names
+  character(len=20), dimension(4), parameter, public :: quantities_3D = (/'u','v','t','q'/)
+  integer, parameter, public :: indU = 1
+  integer, parameter, public :: indV = 2
+  integer, parameter, public :: indT = 3
+  integer, parameter, public :: indQ = 4
+  integer, parameter, public :: nMetQ3D = 4 ! size(quantities_3D)
+
+  character(len=20), dimension(2), parameter, public :: quantities_2D = (/'blh', 'ps '/)
+  integer, parameter, public :: indBLH = 1 ! 
+  integer, parameter, public :: indSP = 2
+  integer, parameter, public :: nMetQ2D = 2 !size(quantities_2D)
+
   
   !
   ! Type for the grid definition. Should be passed together
@@ -46,18 +55,10 @@ module plume_rise_driver
     integer :: nlon, nlat                     ! number of points along longitude / latitude
     real*8 :: dlon_deg, dlat_deg              ! Grid distance in west-east and south-north, degrees and decimals
   end type Tgrid_lonlat
+  
+  type(Tgrid_lonlat), parameter :: grid_missing = Tgrid_lonlat('',-1,-1,-1,-1,-1,-1)
+
   public Tgrid_lonlat
-  !
-  ! Type for the vertical definition. 
-  ! Similar to the grid, should be passed together with the meteodata fields
-  !
-  type Tvertical_hybrid
-    character(len=21) :: vertical_type = 'hybrid_sigma_pressure'  ! just to be sure
-    integer :: nbr_of_levels                           ! the number of layers in the vertical
-    real, dimension(:), allocatable :: a_interface, b_interface  ! hybrid coefficients of the upper interface of the layers
-    real, dimension(:), allocatable :: z_interface  ! level  height above surface, [m]
-  end type Tvertical_hybrid
-  public Tvertical_hybrid
   !
   ! Fire data structure
   !
@@ -65,16 +66,19 @@ module plume_rise_driver
     integer :: nFires                     ! the number of fires in the set
     real, dimension(:), allocatable :: lon, lat, FRP, burnt_area, mdur, moist   ! (nFires)
     real, dimension(:,:), allocatable :: inj_IS4FIRES, inj_PRM  ! (2,nFires) injection bottom and top, [m]
-    logical, dimension(:), allocatable :: ifInsideGrid   ! for the case of regional application
+    integer :: valid_date, valid_time
   end type Tfires
   public Tfires
   !
   ! Meteodata structure
   !
   type Tmeteo_data
-    real, dimension(:,:,:,:), allocatable :: data3d     ! (nz, nx, ny, nQauntities)
-    real, dimension(:,:,:), allocatable :: data2d       ! (nx, ny, nQuantities)
-    character(len=20), dimension(:), allocatable :: quantities_3d, quantities_2d
+    real, dimension(:,:,:), allocatable :: data3d     ! (nz, nfires, nMetQ3D)
+    real, dimension(:,:), allocatable :: data2d       ! (nfires, nMetQ2D)
+    integer :: nbr_of_levels  ! hybrid_sigma_pressure 
+    real, dimension(:), allocatable :: a_interface,  &  !! [a] = [Pa], [b] = [1]
+                                      & b_interface  ! hybrid coefficients of the upper interface of the layers
+    integer :: valid_date, valid_time
   end type Tmeteo_data 
   public Tmeteo_data
 
@@ -84,7 +88,6 @@ CONTAINS
   
   subroutine compute_plume_rise(fires, &                ! fires, input and output
                               & meteo_data, &           ! meteo data, input
-                              & meteo_grid, meteo_vertical, & ! metadata, input
                               & chDumpTemplate)
     !
     ! This is the main subroutine driving the plume-rise odules.
@@ -97,9 +100,10 @@ CONTAINS
     ! Imported parameters
     type(Tfires), intent(inout) :: fires
     type(Tmeteo_data), intent(in) :: meteo_data
-    type(Tgrid_lonlat), intent(in) :: meteo_grid
-    type(Tvertical_hybrid), intent(in) :: meteo_vertical
     character(len=*), intent(in) :: chDumpTemplate
+
+    integer :: indBLH, iFire
+    real :: BVfreq
     
     ! Local parameters.
     !
@@ -113,58 +117,29 @@ CONTAINS
     logical, parameter :: wind_eff=.false., micro_eff=.false.
     
     
-    ! Local variables
-    real, dimension(:,:,:), allocatable :: meteo4fires_column  ! (nLevels, nQuantities, nFires)
-    real, dimension(:,:), allocatable :: meteo4fires_sfc       ! (nQuantities, nFires)
-    integer :: iABL, iBVFreq, iFire, uDump, iThread
-    character(len=5) :: str5
-    !
-    ! First of all, get the data for the fire locations
-    !
-    allocate(meteo4fires_column(meteo_vertical%nbr_of_levels, 6, fires%nFires), &
-           & meteo4fires_sfc(2, fires%nFires))
-    call extract_meteo_data(fires, meteo_data, meteo_grid, meteo_vertical, &
-                          & meteo4fires_column, meteo4fires_sfc)
-    !
-    ! Plume rise from IS4FIRES
-    !
-    iABL = fu_index(meteo_data%quantities_2d, chABL_qName)
-    iBVFreq = fu_index(meteo_data%quantities_2d, chBruntVaisalaFreq_qName)
-    !
     ! Scan all fires calling the corresponding plume-rise routines.
     !
-    !$OMP PARALLEL DEFAULT(SHARED) PRIVATE(iThread, iFire, &
-    !$OMP & uDump, str5)
-    iThread = 0
-    !$ iThread = OMP_GET_THREAD_NUM()
-    write(str5,fmt='(i5)')iThread
-    str5 = adjustl(str5)
-    uDump = 50 + iThread 
-
-    open(uDump, file=chDumpTemplate // trim(str5))
     
-    !$OMP DO schedule (guided)  ! or dynamic but for comparable-size loops guided is better
     do iFire = 1, fires%nFires
       !
       ! Plume rise from IS4FIRES.
       ! The model works in SI units
       !
-      fires%inj_IS4FIRES = -1
+      fires%inj_IS4FIRES(:,:) = -1
+      call bvfreq_for_fire(meteo_data,iFire, BVFreq)
       call IS4FIRES_vertical_profile(fires%FRP(iFire), &
-                                   & meteo4fires_sfc(iABL, iFire), &
-                                   & meteo4fires_sfc(iBVFreq, iFire), &
+                                   & meteo_data%data2d(iFire, indBLH), &
+                                   & BVFreq, &
                                    & .true., &
                                    & fires%inj_IS4FIRES(1,iFire), fires%inj_IS4FIRES(2,iFire))
-      write(uDump,*)'>>>>>>>>>>>> IS4FIRES bottom=', fires%inj_IS4FIRES(1,iFire), &
+      write(*,*)'>>>>>>>>>>>> IS4FIRES bottom=', fires%inj_IS4FIRES(1,iFire), &
                                            & 'top=', fires%inj_IS4FIRES(2,iFire)
       !
       ! Plume rise from PRM
       ! PRM works in randomly picked units, watchout the conversion
       !
       fires%inj_PRM = -1
-      call plumerise_PRMv1(meteo4fires_column(:,:,iFire), meteo_data%quantities_3d, &
-                         & meteo4fires_sfc(:,iFire), meteo_data%quantities_2d, &  
-                         & meteo_vertical, &
+      call plumerise_PRMv1(meteo_data, iFire, &
                          & fires%burnt_area(iFire) * 1e-4, &  ! from m2 to Ha
                          & fires%frp(iFire) * 1e-6, &         ! from W to MW
                          & fires%mdur(iFire) / 60., &         ! from sec to min
@@ -173,18 +148,30 @@ CONTAINS
                          & FRP2CHF,  &
                          & wind_eff, micro_eff, &
                          & .true., .true.,   &   ! ifDebugPrint, ifStoreDump, 
-                         & uDump, & ! debug/dump print file
+                         & 6, & ! debug/dump print file
                          & fires%inj_PRM(1,iFire), fires%inj_PRM(2,iFire))
-      write(uDump,*)'>>>>>>>>>>>> IS4FIRES again bottom=', fires%inj_IS4FIRES(1,iFire), &
+      write(*,*)'>>>>>>>>>>>> IS4FIRES again bottom=', fires%inj_IS4FIRES(1,iFire), &
                                                  & 'top=', fires%inj_IS4FIRES(2,iFire)
-      write(uDump,*)'>>>>>>>>>>>>>>>>>>>>>>> PRM bottom=', fires%inj_PRM(1,iFire), &
+      write(*,*)'>>>>>>>>>>>>>>>>>>>>>>> PRM bottom=', fires%inj_PRM(1,iFire), &
                                                  & 'top=', fires%inj_PRM(2,iFire)
     end do ! cycle over files
-    !$OMP END DO
-
-    !$OMP END PARALLEL
     
   end subroutine compute_plume_rise
+
+ !*******************************************************
+
+ subroutine bvfreq_for_fire(meteodata,iFire, BVFreq)
+      implicit none
+      type (Tmeteo_data), intent(in) :: meteodata
+      integer, intent(in) :: iFire
+      real, intent(out) :: BVFreq
+
+      !FIXME
+      ! Some smarter thing should go here
+      BVFreq =  1e-3
+
+ end subroutine bvfreq_for_fire
+
 
 
   !*********************************************************                            
@@ -221,81 +208,10 @@ CONTAINS
   end function fu_index
 
   
-  !***************************************************************
-  
-  subroutine extract_meteo_data(fires, meteo_data, meteo_grid, meteo_vertical, &
-                              & meteo4fires_column, meteo4fires_sfc)
-    !
-    ! Prepares meteodata for the fire plume rise models
-    ! - picks the data from the grid
-    ! - interpolates columns to the model vertical (for PRM model)
-    !
-    implicit none
-    
-    ! imported parameters
-    type(Tfires), intent(inout) :: fires
-    type(Tmeteo_data), intent(in) :: meteo_data
-    type(Tgrid_lonlat), intent(in) :: meteo_grid
-    type(Tvertical_hybrid), intent(in) :: meteo_vertical
-    real, dimension(:,:,:), intent(out) :: meteo4fires_column  ! (nLevels, nFires, nQuantities)
-    real, dimension(:,:), intent(out) :: meteo4fires_sfc       ! (nFires, nQuantities)
-    
-    ! Local variables
-    integer :: iMet, iFire, ix, iy, izMet
-    real :: xNew, yNew
-    !
-    ! Scan the fires one by one and pick the data
-    !
-    do iFire = 1, fires%nFires
-      !
-      ! Get 2d coordinates
-      !
-      xNew = 1 + (fires%lon(iFire) - meteo_grid%sw_corner_lon) / meteo_grid%dlon_deg
-      yNew = 1 + (fires%lat(iFire) - meteo_grid%sw_corner_lat) / meteo_grid%dlat_deg
-
-      ! If longitude out of grid, try rotate the earth once
-      if(xNew < 0.5)then
-        if(xNew + 360. / meteo_grid%dlon_deg < meteo_grid%nlon + 0.5) &
-                                             & xNew = xNew + 360. / meteo_grid%dlon_deg
-      elseif(xNew > meteo_grid%nlon + 0.5)then
-        if(xNew - 360. / meteo_grid%dlon_deg > 0.5) &
-                                             & xNew = xNew - 360. / meteo_grid%dlon_deg
-      endif
-      ! Are we inside the grid ?
-      ix = nint(xNew)
-      iy = nint(yNew)
-      if(ix < 1 .or. ix > meteo_grid%nlon .or. iy < 1 .or. iy > meteo_grid%nlat)then
-        fires%ifInsideGrid(iFire) = .false.
-        cycle
-      else
-        fires%ifInsideGrid(iFire) = .true.
-      endif
-      !
-      ! Extract data from 2d fields
-      !
-      do iMet = 1, size(meteo_data%quantities_2d)
-        if(meteo_data%quantities_2d(iMet) == '')exit
-        meteo4fires_sfc(iMet, iFire) = meteo_data%data2d(ix,iy,iMet)
-      end do
-      !
-      ! Now, deal with the column. All vriables later will be interpolated 
-      ! to the vertical of the plume-rise model. Here we only extract the column and store the 
-      ! height of the levels
-      !
-      do iMet = 1, size(meteo_data%quantities_3d)  ! number of meteo quantities
-        if(meteo_data%quantities_3d(iMet) == '')exit
-        meteo4fires_column(:,iMet,iFire) = meteo_data%data3d(:,ix,iy,iMet)
-      end do
-    end do  ! nFires
-
-  end subroutine extract_meteo_data
-
 
   !************************************************************************
 
-  subroutine plumerise_PRMv1(meteo4fire_column, quantities_3d, &
-                           & meteo4fire_sfc, quantities_2d, & 
-                           & meteo_vertical, &
+  subroutine plumerise_PRMv1( meteo_data, iFire, &
                            & burnt_area, frp_fire, mdur, moist, & 
                            & alpha,C_epsi,C_delta,C_wind,C_delta_wind, &  ! fire configuration 
                            & FRP2CHF, &
@@ -323,11 +239,8 @@ CONTAINS
     implicit none
     
     ! Imported parameters
-    real, dimension(:,:), intent(in) :: meteo4fire_column  ! (nLevels, nQuantities) no nFires dim
-    real, dimension(:), intent(in) :: meteo4fire_sfc       ! (nQuantities)  no nFires dim
-    character(len=*), dimension(:), intent(in) :: quantities_2d, quantities_3d
-    type(Tvertical_hybrid), intent(in) :: meteo_vertical
-    integer,intent(in) :: uDump
+    type(Tmeteo_data), intent(in) :: meteo_data
+    integer,intent(in) :: ifire, uDump
     real,intent(in) :: burnt_area, frp_fire, mdur, moist ! burnt_area in Ha, as it seems
     real,intent(in) :: alpha,C_epsi,C_delta,C_wind,C_delta_wind
     real,intent(in) :: FRP2CHF ! FRP2TOTALH,CHF2TOTALH
@@ -360,10 +273,7 @@ CONTAINS
     !
     ! Brings the input meteodata into the computation vertical
     !
-    call interpolate_env_profile(meteo4fire_column, quantities_3d, & ! (nzMeteo, nQuantities, nFires)
-                               & meteo4fire_sfc, quantities_2d, &    ! (nQuantities, nFires)
-                               & meteo_vertical%z_interface, &  ! interface height above the ground
-                               & PRM_data)
+    call interpolate_env_profile(meteo_data, meteo_data%nbr_of_levels, iFire,  PRM_data)
     !
     ! Initialize the remainning pieces
     !
@@ -401,89 +311,98 @@ CONTAINS
 
   !*******************************************************************
 
-  subroutine interpolate_env_profile(meteo4fire_column, quantities_3d, &  
-                                   & meteo4fire_sfc, quantities_2d, &
-                                   & zMeteo, &               ! height of meteo levels, [m]
-                                   & dat)
-!  , ucon,vcon,urcon,prcon, tmpcon,dncon,zcon,thtcon,dimz)
+  subroutine interpolate_env_profile(meteo_data, nz_meteo, iFire, dat)
     !
-    ! Projects environmental profiles to the vertical of PRM
+    ! Generates the vertical of PRM and
+    ! Projects environmental profiles to it
+    ! Calculating derived parameters
     !
     implicit none
 
     ! Imported parameters
-    real, dimension(:,:), intent(in) :: meteo4fire_column  ! (nLevels, nQuantities)
-    real, dimension(:), intent(in) :: meteo4fire_sfc       ! ( nQuantities)
-    character(len=*), dimension(:), intent(in) :: quantities_2d, quantities_3d
-    real, dimension(:), intent(in) :: zMeteo
+    type (Tmeteo_data), intent(in) :: meteo_data
+    integer, intent(in) :: nz_meteo, iFire
     type(TPRM_data), intent(inout) :: dat
     
+    real, dimension(nz_meteo):: zMeteo, pMeteo
     ! Local variables
-    integer :: k, nzMet
-    real :: es
-!    real, dimension(nzMet) :: ucon, vcon, thtcon, tmpcon, dncon, prcon, zcon, urcon
-    !
+    integer :: k, iLevMet, iLevPRM
+    real :: es, dz,p,t, pBot, pTop, ps, zbot, ztop
+    real, parameter ::  RAir =   8.314 / 0.02897 ! Rgas / mu_air : [J/K/mol] /  [kg/mol] 
+    real, parameter ::  g  = 9.8
+
     ! set the PRM grid
-    !
-    call set_grid() ! define vertical grid of plume model
+    call set_grid(dat) ! define vertical grid of plume model 
     !
     ! interpolation of the environmental parameters
     !
-    nzMet = size(meteo4fire_column, 1)
-    
-    ! Wind u and v
-!    call htint(nzMet,  ucon, zMeteo, nzPRM, dat%upe, dat%zt)
-    call htint(nzMet, meteo4fire_column(:,fu_index(quantities_3d,'u')), zMeteo, &
-             & nzPRM, dat%upe, dat%zt)
-!    call htint(nzMet,  vcon, zMeteo, nzPRM, dat%vpe, dat%zt)
-    call htint(nzMet, meteo4fire_column(:,fu_index(quantities_3d,'v')), zMeteo, &
-             & nzPRM, dat%vpe, dat%zt)
-    ! Temperature and potential temperature
-!    call htint(nzMet,tmpcon, zMeteo, nzPRM, dat%te , dat%zt)
-    call htint(nzMet, meteo4fire_column(:,fu_index(quantities_3d,'t')), zMeteo, &
-             & nzPRM, dat%te, dat%zt)
-!    call htint(nzMet,thtcon, zMeteo, nzPRM, dat%the, dat%zt)
-    call htint(nzMet, meteo4fire_column(:,fu_index(quantities_3d,'theta')), zMeteo, &
-             & nzPRM, dat%the, dat%zt)
-    ! Pressure, in Pa here
-!    call htint(nzMet, prcon, zMeteo, nzPRM, dat%pe , dat%zt)
-    call htint(nzMet, meteo4fire_column(:,fu_index(quantities_3d,'p')), zMeteo, &
-             & nzPRM, dat%pe, dat%zt)
-    ! Humidity?
-!    call htint(nzMet, urcon, zMeteo, nzPRM, dat%rhe, dat%zt)
-    call htint(nzMet, meteo4fire_column(:,fu_index(quantities_3d,'q')), zMeteo, &
-             & nzPRM, dat%rhe, dat%zt)
 
-    do k = 1, nzPRM
-      !  PE esta em kPa  - ESAT do RAMS esta em mbar = 100 Pa = 0.1 kPa
-      ES = fu_satur_water_vapour_kPa (dat%TE(k)) !blob saturation vapor pressure, kPa
-      dat%QSAT (k) = (.622 * ES) / (dat%PE(k) * 1e-3 - ES) !saturation lwc g/g
-      !calcula qvenv
-      dat%qvenv(k) = max(0.01 * dat%rhe(k) * dat%QSAT(k), 1e-8)
-      !   print*,k,dat%QSAT (k),rhe(k),qvenv(k),rhe(k)*dat%QSAT (k)
+    zbot = 0.
 
-      dat%thve(k) = dat%the(k) * (1. + .61*dat%qvenv(k)) ! virtual pot temperature
-      dat%dne(k) = dat%pe(k) *1e3 / (rgas * dat%te(k)*(1. + .61*dat%qvenv(k))) !  dry air density (kg/m3)
-      dat%vel_e(k) = sqrt(dat%upe(k)**2 + dat%vpe(k)**2)
+    dat%hBL = meteo_data%data2D(iFire, indBLH)
+    ps = meteo_data%data2D(iFire, indSP)
 
-      call thetae(dat%pe(k), dat%te(k), dat%qvenv(k), dat%thee(k), dat%tde(k))
+    zBot = 0
+    pBot =      meteo_data%a_interface(meteo_data%nbr_of_levels) &
+           &  + meteo_data%b_interface(meteo_data%nbr_of_levels)  * ps
 
-      !--------- converte press de Pa para kPa para uso modelo de plumerise
-      dat%pe(k) = dat%pe(k) * 1.e-3
+    iLevPRM = 1         
 
-      dat%SCE(k) = 0.e0 !++ rp intialize the scalar in the environment
-    enddo
+M:  do iLevMet = meteo_data%nbr_of_levels,1,-1
+      pTop =  meteo_data%a_interface(iLevMet+1) +  meteo_data%b_interface(iLevMet+1)*ps
+      T = meteo_data%data3D(iLevMet, iFire, indT)
+      p = 0.5* (pBot + pTop)
+      dz  =  (pBot - pTop) / p * T * RAir / g
+      zTop = zBot + dz
+      do while (dat%zt(iLevPRM) < zTop) 
+        dat%upe(iLevPRM) = meteo_data%data3D(iLevMet, iFire, indU)
+        dat%upe(iLevPRM) = meteo_data%data3D(iLevMet, iFire, indV)
+        dat%rhe(iLevPRM) = meteo_data%data3D(iLevMet, iFire, indQ)
+        dat%te(iLevPRM)  = T
+        dat%pe(iLevPRM)  =  p
+        dat%the(iLevPRM)  = T *  (1e5/p)**0.2854
 
-    !++ rp get the high of the mixing layer form the maximum of the relative humidity.
-    dat%hBL = meteo4fire_sfc(fu_index(quantities_2d, chABL_qName))
+
+        !  PE esta em kPa  - ESAT do RAMS esta em mbar = 100 Pa = 0.1 kPa
+        ES = fu_satur_water_vapour_kPa (dat%TE(iLevPRM)) !blob saturation vapor pressure, kPa
+        dat%QSAT (iLevPRM) = (.622 * ES) / (dat%PE(iLevPRM) * 1e-3 - ES) !saturation lwc g/g
+        !calcula qvenv
+        dat%qvenv(iLevPRM) = max(0.01 * dat%rhe(iLevPRM) * dat%QSAT(iLevPRM), 1e-8)
+        !   print*,iLevPRM,dat%QSAT (iLevPRM),rhe(iLevPRM),qvenv(iLevPRM),rhe(iLevPRM)*dat%QSAT (iLevPRM)
+
+        dat%thve(iLevPRM) = dat%the(iLevPRM) * (1. + .61*dat%qvenv(iLevPRM)) ! virtual pot temperature
+        dat%dne(iLevPRM) = dat%pe(iLevPRM) *1e3 / (rgas * dat%te(iLevPRM)*(1. + .61*dat%qvenv(iLevPRM))) !  dry air density (kg/m3)
+        dat%vel_e(iLevPRM) = sqrt(dat%upe(iLevPRM)**2 + dat%vpe(iLevPRM)**2)
+
+        call thetae(dat%pe(iLevPRM), dat%te(iLevPRM), dat%qvenv(iLevPRM), dat%thee(iLevPRM), dat%tde(iLevPRM))
+
+        !--------- converte press de Pa para kPa para uso modelo de plumerise
+        dat%pe(iLevPRM) = dat%pe(iLevPRM) * 1.e-3
+
+        dat%SCE(iLevPRM) = 0.e0 !++ rp intialize the scalar in the environment
+        iLevPRM = iLevPRM + 1
+
+        if (iLevPRM > nzPRM) then
+              exit M
+        endif
+      enddo !! over iLevPRM
+    enddo M
+    if (iLevMet < 1) then
+      print *, "This should not happen, iLevMet =", iLevMet 
+      stop 1
+    endif
+
+
+
 
     CONTAINS
 
       !===========================================================
 
-      subroutine set_grid()
+      subroutine set_grid(dat)
 
         implicit none
+        type(TPRM_data), intent(inout) :: dat
         integer :: k
 
         !dz=50. ! set constant grid spacing of plume grid model(meters)
@@ -612,5 +531,390 @@ CONTAINS
       end function fu_satur_water_vapour_kPa
       
     end subroutine interpolate_env_profile
+
+
+     !*************************************************************
+
+
+    subroutine grid_from_grib(igrib_in, grid)
+        integer, intent(in) :: igrib_in
+        type( Tgrid_lonlat), intent(out) :: grid
+
+        character(len=256) :: strTmp
+        real*8 :: dTmp
+        integer :: iTmp, jTmp, iStat
+        character(len=*), parameter :: sub_name = 'grid_from_grib'
+
+
+        call grib_get(igrib_in, 'gridType', strTmp, status = iStat)
+        call codes_check(iStat, sub_name, 'gridType')
+        if (strTmp /= 'regular_ll') then
+          print *, 'Grid ', strTmp, 'not imlemented, only regular_ll so far...'
+          stop 1
+        endif 
+        grid%grid_type = 'lonlat'
+
+        call codes_get(igrib_in,'Ni', grid%nlon, status = iStat)
+        call codes_check(iStat, sub_name, 'Ni')
+        call codes_get(igrib_in,'Nj', grid%nlat, status = iStat)
+        call codes_check(iStat, sub_name, 'Nj')
+
+        call codes_get(igrib_in,'Ni', grid%nlon, status = iStat)
+        call codes_check(iStat, sub_name, 'Ni')
+        call codes_get(igrib_in,'Nj', grid%nlat, status = iStat)
+        call codes_check(iStat, sub_name, 'Nj')
+
+
+
+        !!! Here we do not flip the input array, but rather flip the origin and the sign of the increment
+        !! Longitude
+        call codes_get(igrib_in,'iDirectionIncrementInDegrees', grid%dlon_deg, status = iStat)
+        call codes_check(iStat, sub_name, 'iDirectionIncrementInDegrees')
+        call grib_get(igrib_in, 'iScansNegatively', iTmp, status = iStat)
+        call codes_check(iStat, sub_name, 'iScansNegatively')
+
+        call codes_get(igrib_in,'longitudeOfFirstGridPointInDegrees', grid%sw_corner_lon, status = iStat)
+        call codes_check(iStat, sub_name, 'longitudeOfFirstGridPointInDegrees')
+        if (iTmp == 0) then !!Negative scan order 
+          grid%dlat_deg = -1 * grid%dlat_deg
+        endif
+
+        !! Latitude
+        call codes_get(igrib_in,'jDirectionIncrementInDegrees', grid%dlat_deg, status = iStat)
+        call codes_check(iStat, sub_name, 'jDirectionIncrementInDegrees')
+        call grib_get(igrib_in, 'jScansPositively', iTmp, status = iStat)
+        call codes_check(iStat, sub_name, 'jScanspositively')
+
+        call codes_get(igrib_in,'latitudeOfFirstGridPointInDegrees', grid%sw_corner_lat, status = iStat)
+        call codes_check(iStat, sub_name, 'latitudeOfFirstGridPointInDegrees')
+        if (iTmp == 0) then !!Negative scan order
+          grid%dlat_deg = -1 * grid%dlat_deg
+        endif
+
+
+    
+    end subroutine grid_from_grib
+
+     !*************************************************************
+
+
+     subroutine datetime_from_grib(igrib_in, dataDate, dataTime)
+        implicit none
+        integer, intent(in) :: igrib_in
+        integer, intent(out) :: dataDate, dataTime
+        character(len=*), parameter :: sub_name = 'datetime_from_grib'
+        integer :: iStat
+
+        call codes_get(igrib_in,'dataDate', dataDate, status=iStat)
+        call codes_check(iStat, sub_name, 'dataDate')
+        call codes_get(igrib_in,'dataTime', dataTime, status=iStat)
+        call codes_check(iStat, sub_name, 'dataTime')
+
+
+     end subroutine datetime_from_grib
+
+     !*************************************************************
+
+    
+
+     subroutine acquire_fires(fires, fire_grib)
+
+       implicit none
+        type(Tfires), intent(out) :: fires
+        character(len=*) :: fire_grib
+
+        integer :: iUnit, igrib_in, nFires, iTmp, jTmp, iStat
+        real :: fTmp
+        character(len=200) :: shortname
+        real, dimension(:), allocatable   :: values
+        type( Tgrid_lonlat) :: grid
+        character(len = *), parameter :: frpname = 'frpfire'
+        character(len=*), parameter :: sub_name = 'acquire_fires'
+
+        call codes_open_file(iUnit,fire_grib,'r')
+
+        igrib_in = 1
+        do while (igrib_in > 0) 
+          call codes_grib_new_from_file(iUnit,igrib_in)
+          call codes_get(igrib_in,'shortName',shortname, status=iStat)
+          call codes_check(iStat, sub_name, 'shortName')
+          if (shortname == frpname) exit
+          call codes_release(igrib_in)
+        enddo
+
+        if (igrib_in < 0) then
+          print *, "Failed to find frpfire in ", fire_grib 
+          stop
+        endif
+        call grid_from_grib(igrib_in, grid)
+        print *, "Fire grid:", grid
+        allocate(values(grid%nlon * grid%nlat))
+        call codes_get(igrib_in,'values', values, status=iStat) !! Comes as W/m2
+        call codes_check(iStat, sub_name, 'values')
+
+        call datetime_from_grib(igrib_in, fires%valid_date, fires%valid_time)
+
+        ! Init fires
+        fires%nFires= count(values>0)
+        allocate(fires%lon(fires%nFires), fires%lat(fires%nFires), fires%FRP(fires%nFires), &
+               & fires%burnt_area(fires%nFires), fires%mdur(fires%nFires), fires%moist(fires%nFires))
+        fires%burnt_area(:) = F_NAN
+        fires%mdur(:)  = F_NAN
+        fires%moist(:) =  F_NAN
+
+        allocate(fires%inj_IS4FIRES(2, fires%nFires), fires%inj_PRM(2, fires%nFires))
+        fires%inj_IS4FIRES(:,:) = F_NAN
+        fires%inj_PRM(:,:) = F_NAN
+
+        ! Put fires to the structure
+        jTmp = 1
+        fTmp = earth_radius * degrees_to_radians !! degrees to meters
+        fTmp =  fTmp * fTmp !! square of it
+        do iTmp = 1, Size(values)
+          if (values(iTmp) <= 0.) cycle
+          
+          fires%lon(jTmp) = grid%sw_corner_lon + modulo(iTmp-1,grid%nlon) * grid%dlon_deg
+          fires%lat(jTmp) = grid%sw_corner_lat + ((iTmp - 1)  / grid%nlon)  * grid%dlat_deg
+          if (fires%lat(jTmp) < -90) then
+            print *, 'Ops'
+          endif
+
+          ! incoming frp * cell_area
+          fires%FRP(jTmp) = values(iTmp) * abs(grid%dlon_deg*grid%dlat_deg) * fTmp &
+                        & * cos(fires%lat(jTmp)*degrees_to_radians)
+
+          jTmp = jTmp + 1
+        enddo
+
+        if (jTmp - 1 /= fires%nFires) then
+          print *, 'Oooops: Fire number mismatch: ', jTmp -1,  fires%nFires
+          stop 3
+        endif
+        call codes_release(igrib_in)
+        call codes_close_file(iUnit) 
+
+    end subroutine acquire_fires
+
+    
+  !***************************************************************
+  
+  subroutine fires_to_meteo(fires,  meteo_grid, idxMeteo)
+    !
+    ! Assigns meteo index to fires and sets ifInsideGrid(iFire)
+
+    implicit none
+    
+    ! imported parameters
+    type(Tfires), intent(in) :: fires
+    type(Tgrid_lonlat), intent(in) :: meteo_grid
+    integer, dimension(:), allocatable, intent(inout) ::  idxMeteo ! Can be allocated or not
+    
+    ! Local variables
+    integer :: iMet, iFire, ix, iy, izMet
+    real :: xNew, yNew
+
+
+    if (.not. allocated(idxMeteo)) then
+        allocate(idxMeteo(fires%nFires))
+    endif
+    !
+    ! Scan the fires one by one and assign coordinates
+    !
+    do iFire = 1, fires%nFires
+      !
+      ! Get 2d coordinates
+      !
+      xNew = 1 + (fires%lon(iFire) - meteo_grid%sw_corner_lon) / meteo_grid%dlon_deg
+      yNew = 1 + (fires%lat(iFire) - meteo_grid%sw_corner_lat) / meteo_grid%dlat_deg
+
+      ! If longitude out of grid, try rotate the earth once
+      if(xNew < 0.5)then
+        if(xNew + 360. / meteo_grid%dlon_deg < meteo_grid%nlon + 0.5) &
+                                             & xNew = xNew + 360. / meteo_grid%dlon_deg
+      elseif(xNew > meteo_grid%nlon + 0.5)then
+        if(xNew - 360. / meteo_grid%dlon_deg > 0.5) &
+                                             & xNew = xNew - 360. / meteo_grid%dlon_deg
+      endif
+
+      ! Are we inside the grid ?
+      ix = nint(xNew)
+      iy = nint(yNew)
+      if(ix < 1 .or. ix > meteo_grid%nlon .or. iy < 1 .or. iy > meteo_grid%nlat)then
+        idxMeteo(iFire) = -1
+      else
+        idxMeteo(iFire) = ix + (iy - 1) * meteo_grid%nlon
+      endif
+    end do  ! nFires
+    print *, "Projected ", count(idxMeteo>0), ' fires of total ', fires%nFires
+
+  end subroutine fires_to_meteo
+
+
+  !************************************************************************
+
+
+    subroutine acquire_meteo(meteo, fires, meteo_grib_files)
+
+      !
+      !Store meteo profiles for each fire. 
+      ! Extraction of fire columns from GRIB files
+      ! 
+     
+ 
+      implicit none
+      type(Tmeteo_data), intent(out) :: meteo
+      character(len=*), dimension(:), intent(in) :: meteo_grib_files
+      type(Tfires), intent(in) :: fires
+
+      integer :: iUnit, igrib_in, nFires, iTmp, jTmp, iStat, iLev, iVal2D, iVal3D, iFile
+      integer :: dataDate, dataTime
+      real :: fTmp
+      character(len=200) :: typeOfLevel, shortname
+      real, dimension(:), allocatable   :: values, pv
+      integer, dimension(:), allocatable   :: idxMeteo
+      type( Tgrid_lonlat) :: grid, meteo_grid
+      character(len =* ), parameter :: frpname = 'frpfire'
+      character(len=*), parameter :: sub_name = 'acquire_meteo'
+
+
+      
+      allocate( meteo%data2d(fires%nFires, nMetQ2D))
+      meteo%data2d(:, :) = F_NAN
+
+      meteo_grid = grid_missing
+      meteo%valid_date = fires%valid_date
+      meteo%valid_time = fires%valid_time
+     
+
+      do iFile = 1, size(meteo_grib_files)
+
+        call codes_open_file(iUnit,meteo_grib_files(iFile),'r', status=iStat)
+        call codes_check(iStat, sub_name, 'open')
+
+        do while (.True.) 
+            call codes_grib_new_from_file(iUnit, igrib_in)
+            if (igrib_in < 1) exit
+
+            call datetime_from_grib(igrib_in, dataDate, dataTime)
+            call codes_get(igrib_in,'typeOfLevel', typeOfLevel, status=iStat)
+            call codes_check(iStat, sub_name, 'typeOfLevel')
+            call grid_from_grib(igrib_in, grid)
+
+            !!if ((dataDate /= meteo%valid_date) .or. (dataTime /= meteo%valid_time)) then
+            if ((dataDate /= meteo%valid_date) ) then  !!! Proper FIXME time matching needed
+                call codes_release(igrib_in)
+
+                print *, "skipping message ", dataDate, dataTime
+                print *, "Fires date and time", meteo%valid_date, meteo%valid_time
+                cycle
+            endif
+            
+            if (  meteo_grid%nlat /= grid%nlat .or. meteo_grid%nlon /= grid%nlon ) then ! Poor-man's "/="
+              meteo_grid = grid
+              print *, "Meteo grid:", grid
+              call  fires_to_meteo(fires,  meteo_grid, idxMeteo)
+              if (.not. allocated(values)) allocate(values(meteo_grid%nlat * meteo_grid%nlon))
+            endif
+
+            call codes_get(igrib_in,'shortName',shortName, status=iStat)
+            call codes_check(iStat, sub_name, 'shortName')
+
+            ! Not found yet
+            iVal3D = -1
+            iVal2D = -1
+
+            if (typeOfLevel == 'hybrid' ) then
+                 ! Do we ned it at all?
+                 do iVal3D = 1, nMetQ3D
+                    if (quantities_3d(iVal3D) == shortName) then
+                      call codes_get(igrib_in,'level', iLev, status=iStat)
+                      call codes_check(iStat, sub_name, 'level')
+                      exit
+                   endif
+                 enddo
+
+                 if (ival3D > nmetQ3D) then
+                    ival3D = -1
+                    call codes_release(igrib_in)
+                !    print *, "skipping message 3D"
+                    cycle 
+                 endif
+
+                 ! 
+                 ! iquantity and level is here now, make sure that the vertical is okay
+
+                 call codes_get(igrib_in,'NV', iTmp, status=iStat)
+                 call codes_check(iStat, sub_name, 'NV')
+                 if (.not. allocated(meteo%a_interface)) then
+                      meteo%nbr_of_levels = iTmp/2 - 1 
+                      allocate(pv(iTmp), meteo%a_interface(iTmp/2), meteo%b_interface(iTmp/2))
+                      allocate(meteo%data3d(meteo%nbr_of_levels,fires%nFires, nMetQ3D))
+                      meteo%a_interface(:) = F_NAN
+                      meteo%b_interface(:) = F_NAN
+                      meteo%data3d(:,:,:) = F_NAN
+                 endif
+                 if (meteo%nbr_of_levels + 1 /= iTmp/2) then
+                    print *, "Vertical size mismatch"
+                    stop 1
+                 endif
+                 call codes_get(igrib_in,'pv', pv, status=iStat)
+                 call codes_check(iStat, sub_name, 'pv')
+                 if (meteo%a_interface(1) /= meteo%a_interface(1)) then ! Verical not yet defined
+                    meteo%a_interface(:) =  pv(1:iTmp/2)  !!Pa
+                    meteo%b_interface(:) =  pv(iTmp/2+1:iTmp) ! 
+                 else
+                     if (any(meteo%a_interface /= pv(1:iTmp/2))) then
+                        print *, "Vertical values mismatch"
+                        stop 1
+                     endif
+                 endif
+
+            elseif (typeOfLevel == 'surface' ) then
+                 do iVal2D = 1, nMetQ2D
+                    if (quantities_2D(iVal2D) == shortName) exit
+                 enddo
+
+                 if (ival2D > nMetQ2D) then
+                    ival2D = -1
+                    call codes_release(igrib_in)
+               !     print *, "skipping message 2D "
+                    cycle 
+                 endif
+            else
+                call codes_release(igrib_in)
+                print *, "skipping message (leveltype)"
+                cycle 
+            endif
+
+            !
+            ! Now we have either iVal2D > 0 or (iVal3D > 0 and reasonable iLevel)
+
+            call codes_get(igrib_in,'values',values, status=iStat)
+            call codes_check(iStat, sub_name, 'values')
+            if (iVal2D > 0 ) then
+              !print *, "Store 2D ", trim(shortName), ', lev', iLev
+              do iTmp = 1,fires%nFires
+                  if (idxMeteo(iTmp)>0) then
+                    meteo%data2d(iTmp, iVal2D) = values(idxMeteo(iTmp))
+                  endif
+              enddo
+            elseif (iVal3D > 0 ) then
+              !print *, "Store 3D ", trim(shortName), ', lev', iLev
+              do iTmp = 1,fires%nFires
+                  if (idxMeteo(iTmp)>0) then
+                    meteo%data3d(iLev,iTmp, iVal3D) = values(idxMeteo(iTmp))
+                  endif
+              enddo
+            else
+              print *, "This should not happen ever!", sub_name
+              stop 2
+           endif
+           call codes_release(igrib_in)
+        enddo
+        call codes_close_file(iUnit)
+      enddo
+
+    end subroutine acquire_meteo
+
 
 end module plume_rise_driver

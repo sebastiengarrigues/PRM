@@ -76,4 +76,11 @@ real, public, parameter ::            &
   real, public, parameter :: tfreeze = 269.3, e1 = 1./3., e2 = 5./3.
   real, public, PARAMETER :: SRC = HEATSUBL / CP, FRC = HEATFUS / CP
 
+  REAL, PARAMETER, PUBLIC :: radians_to_degrees =  57.29577951
+  REAL, PARAMETER, PUBLIC :: degrees_to_radians =  0.01745329252
+  REAL, PARAMETER, PUBLIC :: earth_radius = 6378000.0
+  REAL, PARAMETER, PUBLIC :: F_NAN = TRANSFER(2143289344,1.0)
+
+
+
 end Module
