@@ -18,10 +18,14 @@ plumeRise_PRMv1.o: rconstants.o
 
 
 $(PROG): $(OBJS)
-	$(FC) $(OBJS) -fopenmp  -o $(PROG)
+	$(FC) $(OBJS) -fopenmp -leccodes -leccodes_f90 -o $(PROG)
 	mv *.o ../obj/
 	mv *.mod ../obj/
 	mv $(PROG) ../bin/
 
 clean:
 	rm -rf $(OBJS) $(PROG) 
+
+
+ctags:
+	ctags -R
