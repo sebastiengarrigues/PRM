@@ -25,6 +25,7 @@ module plume_rise_driver
 
   public acquire_fires
   public acquire_meteo
+  public store_plume_rise
   
   ! private subroutines of this module
   private fu_index
@@ -32,14 +33,14 @@ module plume_rise_driver
   ! Public constants from this module
 
   ! GRIB short names
-  character(len=20), dimension(4), parameter, public :: quantities_3D = (/'u','v','t','q'/)
+  character(len=20), dimension(4), parameter, public :: quantities_3D = [Character(len=20) :: 'u','v','t','q']
   integer, parameter, public :: indU = 1
   integer, parameter, public :: indV = 2
   integer, parameter, public :: indT = 3
   integer, parameter, public :: indQ = 4
   integer, parameter, public :: nMetQ3D = 4 ! size(quantities_3D)
 
-  character(len=20), dimension(2), parameter, public :: quantities_2D = (/'blh', 'ps '/)
+  character(len=20), dimension(2), parameter, public :: quantities_2D = [Character(len=20) :: 'blh', 'sp' ]
   integer, parameter, public :: indBLH = 1 ! 
   integer, parameter, public :: indSP = 2
   integer, parameter, public :: nMetQ2D = 2 !size(quantities_2D)
@@ -102,7 +103,7 @@ CONTAINS
     type(Tmeteo_data), intent(in) :: meteo_data
     character(len=*), intent(in) :: chDumpTemplate
 
-    integer :: indBLH, iFire
+    integer :: iFire
     real :: BVfreq
     
     ! Local parameters.
@@ -120,40 +121,40 @@ CONTAINS
     ! Scan all fires calling the corresponding plume-rise routines.
     !
     
+    fires%inj_IS4FIRES(:,:) = -1
     do iFire = 1, fires%nFires
       !
       ! Plume rise from IS4FIRES.
       ! The model works in SI units
       !
-      fires%inj_IS4FIRES(:,:) = -1
       call bvfreq_for_fire(meteo_data,iFire, BVFreq)
       call IS4FIRES_vertical_profile(fires%FRP(iFire), &
                                    & meteo_data%data2d(iFire, indBLH), &
                                    & BVFreq, &
                                    & .true., &
                                    & fires%inj_IS4FIRES(1,iFire), fires%inj_IS4FIRES(2,iFire))
-      write(*,*)'>>>>>>>>>>>> IS4FIRES bottom=', fires%inj_IS4FIRES(1,iFire), &
-                                           & 'top=', fires%inj_IS4FIRES(2,iFire)
+!      write(*,*)'>>>>>>>>>>>> IS4FIRES bottom=', fires%inj_IS4FIRES(1,iFire), &
+!                                           & 'top=', fires%inj_IS4FIRES(2,iFire)
       !
       ! Plume rise from PRM
       ! PRM works in randomly picked units, watchout the conversion
       !
       fires%inj_PRM = -1
-      call plumerise_PRMv1(meteo_data, iFire, &
-                         & fires%burnt_area(iFire) * 1e-4, &  ! from m2 to Ha
-                         & fires%frp(iFire) * 1e-6, &         ! from W to MW
-                         & fires%mdur(iFire) / 60., &         ! from sec to min
-                         & fires%moist(iFire), &        ! remains fraction
-                         & alpha, C_epsi, C_delta, C_wind, C_delta_wind,  &  ! fire configuration 
-                         & FRP2CHF,  &
-                         & wind_eff, micro_eff, &
-                         & .true., .true.,   &   ! ifDebugPrint, ifStoreDump, 
-                         & 6, & ! debug/dump print file
-                         & fires%inj_PRM(1,iFire), fires%inj_PRM(2,iFire))
+!!!!      call plumerise_PRMv1(meteo_data, iFire, &
+!!!!                         & fires%burnt_area(iFire), &  ! from m2 
+!!!!                         & fires%frp(iFire) * 1e-6, &         ! from W to MW
+!!!!                         & fires%mdur(iFire) / 60., &         ! from sec to min
+!!!!                         & fires%moist(iFire), &        ! remains fraction
+!!!!                         & alpha, C_epsi, C_delta, C_wind, C_delta_wind,  &  ! fire configuration 
+!!!!                         & FRP2CHF,  &
+!!!!                         & wind_eff, micro_eff, &
+!!!!                         & .True., .False.,   &   ! ifDebugPrint, ifStoreDump, 
+!!!!                         & 6, & ! debug/dump print file
+!!!!                         & fires%inj_PRM(1,iFire), fires%inj_PRM(2,iFire))
       write(*,*)'>>>>>>>>>>>> IS4FIRES again bottom=', fires%inj_IS4FIRES(1,iFire), &
                                                  & 'top=', fires%inj_IS4FIRES(2,iFire)
-      write(*,*)'>>>>>>>>>>>>>>>>>>>>>>> PRM bottom=', fires%inj_PRM(1,iFire), &
-                                                 & 'top=', fires%inj_PRM(2,iFire)
+   !   write(*,*)'>>>>>>>>>>>>>>>>>>>>>>> PRM bottom=', fires%inj_PRM(1,iFire), &
+   !                                              & 'top=', fires%inj_PRM(2,iFire)
     end do ! cycle over files
     
   end subroutine compute_plume_rise
@@ -241,7 +242,7 @@ CONTAINS
     ! Imported parameters
     type(Tmeteo_data), intent(in) :: meteo_data
     integer,intent(in) :: ifire, uDump
-    real,intent(in) :: burnt_area, frp_fire, mdur, moist ! burnt_area in Ha, as it seems
+    real,intent(in) :: burnt_area, frp_fire, mdur, moist ! burnt_area in M2
     real,intent(in) :: alpha,C_epsi,C_delta,C_wind,C_delta_wind
     real,intent(in) :: FRP2CHF ! FRP2TOTALH,CHF2TOTALH
     logical,intent(in) :: wind_eff,micro_eff
@@ -337,19 +338,17 @@ CONTAINS
     ! interpolation of the environmental parameters
     !
 
-    zbot = 0.
-
     dat%hBL = meteo_data%data2D(iFire, indBLH)
     ps = meteo_data%data2D(iFire, indSP)
 
     zBot = 0
-    pBot =      meteo_data%a_interface(meteo_data%nbr_of_levels) &
-           &  + meteo_data%b_interface(meteo_data%nbr_of_levels)  * ps
+    pBot =      meteo_data%a_interface(meteo_data%nbr_of_levels+1) &
+           &  + meteo_data%b_interface(meteo_data%nbr_of_levels+1)  * ps
 
     iLevPRM = 1         
 
 M:  do iLevMet = meteo_data%nbr_of_levels,1,-1
-      pTop =  meteo_data%a_interface(iLevMet+1) +  meteo_data%b_interface(iLevMet+1)*ps
+      pTop =  meteo_data%a_interface(iLevMet) +  meteo_data%b_interface(iLevMet)*ps
       T = meteo_data%data3D(iLevMet, iFire, indT)
       p = 0.5* (pBot + pTop)
       dz  =  (pBot - pTop) / p * T * RAir / g
@@ -386,8 +385,12 @@ M:  do iLevMet = meteo_data%nbr_of_levels,1,-1
               exit M
         endif
       enddo !! over iLevPRM
+      zBot = zTop
+      pBot = pTop
     enddo M
     if (iLevMet < 1) then
+      print *, "iLevMet = ", iLevMet, ' zBot, zTop, p: ', zBot, zTop, p, "iLevPRM, nzPRM, dat%zt(iLevPRM) ", iLevPRM, &
+                 & nzPRM, dat%zt(iLevPRM)
       print *, "This should not happen, iLevMet =", iLevMet 
       stop 1
     endif
@@ -433,47 +436,6 @@ M:  do iLevMet = meteo_data%nbr_of_levels,1,-1
         return
       end subroutine set_grid
 
-      !===========================================================
-
-      SUBROUTINE htint (nzz1, vctra, eleva, nzz2, vctrb, elevb)
-        IMPLICIT NONE
-        INTEGER, INTENT(IN ) :: nzz1
-        INTEGER, INTENT(IN ) :: nzz2
-        REAL,    INTENT(IN ) :: vctra(nzz1)
-        REAL,    INTENT(OUT) :: vctrb(nzz2)
-        REAL,    INTENT(IN ) :: eleva(nzz1)
-        REAL,    INTENT(IN ) :: elevb(nzz2)
-
-        INTEGER :: l
-        INTEGER :: k
-        INTEGER :: kk
-        REAL    :: wt
-
-        l=1
-        DO k=1,nzz2
-          DO
-            IF ( (elevb(k) <  eleva(1)) .OR. &
-              ((elevb(k) >= eleva(l)) .AND. (elevb(k) <= eleva(l+1))) ) THEN
-              wt       = (elevb(k)-eleva(l))/(eleva(l+1)-eleva(l))
-              vctrb(k) = vctra(l)+(vctra(l+1)-vctra(l))*wt
-              EXIT
-            ELSE IF ( elevb(k) >  eleva(nzz1))  THEN
-              wt       = (elevb(k)-eleva(nzz1))/(eleva(nzz1-1)-eleva(nzz1))
-              vctrb(k) = vctra(nzz1)+(vctra(nzz1-1)-vctra(nzz1))*wt
-              EXIT
-            END IF
-            l=l+1
-            IF(l == nzz1) THEN
-              PRINT *,'htint:nzz1',nzz1
-              DO kk=1,l
-                PRINT*,'kk,eleva(kk),elevb(kk)',eleva(kk),elevb(kk)
-              END DO
-              STOP 'htint'
-            END IF
-          END DO
-        END DO
-      END SUBROUTINE htint
-      
       !========================================================================
 
       real function fu_satur_water_vapour_kPa(temperature)
@@ -621,14 +583,14 @@ M:  do iLevMet = meteo_data%nbr_of_levels,1,-1
 
        implicit none
         type(Tfires), intent(out) :: fires
-        character(len=*) :: fire_grib
+        character(len=*), intent(in) :: fire_grib
 
         integer :: iUnit, igrib_in, nFires, iTmp, jTmp, iStat
         real :: fTmp
         character(len=200) :: shortname
         real, dimension(:), allocatable   :: values
         type( Tgrid_lonlat) :: grid
-        character(len = *), parameter :: frpname = 'frpfire'
+        character(len = *), parameter :: frpname = 'frpfire'  ! ParamID 210099
         character(len=*), parameter :: sub_name = 'acquire_fires'
 
         call codes_open_file(iUnit,fire_grib,'r')
@@ -685,6 +647,12 @@ M:  do iLevMet = meteo_data%nbr_of_levels,1,-1
 
           jTmp = jTmp + 1
         enddo
+
+        !FIXME   Put something to make Plume-rise model happpy
+        fires%burnt_area(:) = 1e6     ! m2  MODIS pixel is 1x1 km2 or more
+        fires%mdur(:) = 3600.0              ! fire duration, sec
+        fires%moist(:) = 0.8                ! fuel moisture, fraction
+
 
         if (jTmp - 1 /= fires%nFires) then
           print *, 'Oooops: Fire number mismatch: ', jTmp -1,  fires%nFires
@@ -892,7 +860,7 @@ M:  do iLevMet = meteo_data%nbr_of_levels,1,-1
             call codes_get(igrib_in,'values',values, status=iStat)
             call codes_check(iStat, sub_name, 'values')
             if (iVal2D > 0 ) then
-              !print *, "Store 2D ", trim(shortName), ', lev', iLev
+              print *, "Store 2D ", trim(shortName), ', lev', iLev
               do iTmp = 1,fires%nFires
                   if (idxMeteo(iTmp)>0) then
                     meteo%data2d(iTmp, iVal2D) = values(idxMeteo(iTmp))
@@ -916,5 +884,98 @@ M:  do iLevMet = meteo_data%nbr_of_levels,1,-1
 
     end subroutine acquire_meteo
 
+  !************************************************************************
+
+     subroutine store_plume_rise(fires, frpgrib, plumerisegrib) 
+
+       !
+       ! Stores output by substituting parmeterID and alues in the input messages
+       !
+
+       implicit none
+        type(Tfires), intent(in) :: fires
+        character(len=*), intent(in) :: frpgrib, plumerisegrib
+
+        integer :: iUnit, indGrib,  indGribOut, iCell, iFire, iStat
+        real :: fTmp
+        character(len=200) :: shortname
+        real, dimension(:), allocatable   :: values
+        integer, dimension(:), allocatable   :: iOutFire ! Index in the output grid for plume
+        type( Tgrid_lonlat) :: grid
+        character(len = *), parameter :: frpname = 'frpfire'
+        character(len=*), parameter :: sub_name = 'store_plume_rise'
+        integer, parameter :: ParamID_I4Finjh = 210060  !	Injection height (from IS4FIRES)  210060 
+        integer, parameter :: ParamID_I4Ftop = 210119 ! Mean altitude of maximum injection 210119 !! Metres above sea level
+
+        call codes_open_file(iUnit, frpgrib ,'r')
+
+        indGrib = 1
+        do while (indGrib > 0) 
+          call codes_grib_new_from_file(iUnit,indGrib)
+          call codes_get(indGrib,'shortName',shortname, status=iStat)
+          call codes_check(iStat, sub_name, 'shortName')
+          if (shortname == frpname) exit
+          call codes_release(indGrib)
+        enddo
+
+        if (indGrib < 0) then
+          print *, "Failed to find frpfire in ", frpgrib
+          stop
+        endif
+        call grid_from_grib(indGrib, grid)
+        print *, "Fire grid:", grid
+        allocate(values(grid%nlon * grid%nlat), iOutFire(fires%nfires))
+        call codes_get(indGrib,'values', values, status=iStat) !! Comes as W/m2
+        call codes_check(iStat, sub_name, 'values')
+        call codes_close_file(iUnit) 
+
+
+        !Here we rely on the fact that the frp file is exactly the same as one used for 
+        iFire = 0
+        do iCell = 1, Size(values)
+          if (values(iCell) <= 0.) cycle
+          iFire = iFire + 1
+          if (iFire > fires%nfires) then
+            print *, "Fire index ", iFire, " > fires%nfires = ", fires%nfires
+            stop 1
+          endif
+          iOutFire(iFire) = iCell
+        enddo
+        if (iFire /= fires%nFires) then
+          print *, 'Oooops: Fire number mismatch in ', sub_name, " : ", iFire,  fires%nFires
+          stop 3
+        endif
+
+
+        ! Prepare array of "Injection height (from IS4FIRES)" from "plume bottom" and "plume top"
+        ! with simple average
+        do iFire = 1,fires%nfires
+            iCell = iOutFire(iFire)
+            fTmp = values(iCell)
+            values(iCell) = 0.5*(fires%inj_IS4FIRES(1,iFire) + fires%inj_IS4FIRES(2,iFire))
+        enddo 
+
+        call codes_open_file(iUnit, plumerisegrib, 'w')
+        
+        call codes_set(indGrib, 'paramId' ,ParamID_I4Finjh, status=iStat)
+        call codes_check(iStat, sub_name, 'Set paramId')
+
+        call codes_set(indGrib, 'packingType' , 'grid_simple', status=iStat)
+        call codes_check(iStat, sub_name, 'set packingType')
+
+        call codes_set(indGrib, 'values' , values, status=iStat)
+        call codes_check(iStat, sub_name, 'Set values')
+
+        call codes_write(indGrib, iUnit, status=iStat)
+        call codes_check(iStat, sub_name, 'codes_write')
+        call codes_release(indGrib)
+        call codes_close_file(iUnit) 
+        deallocate (values, iOutFire)
+
+    end  subroutine store_plume_rise
+
+    
+  !***************************************************************
+  
 
 end module plume_rise_driver

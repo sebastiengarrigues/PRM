@@ -18,9 +18,11 @@ program test_plume_rise
   real :: a, b, fABL, pressure
   character(len=100) :: strTmp
   character(len=*), parameter :: frpgrib='../Input/z_cams_c_ecmf_202104260200_gfas_an_sfc_001_frpfire.grib'
-  character(len=100), dimension(2), parameter :: metgribs = [Character(len=100) ::  &
-                                                            & "../Meteo/ecglob1000_2021042600+002grib2.ml", &
-                                                            & "../Meteo/ecglob1000_2021042600+002.sfc" ]
+  character(len=*), parameter :: plumerisegrib='../output/z_cams_c_ecmf_202104260200_gfas_an_sfc_001_PLUMERIZE.grib'
+  character(len=100), dimension(3), parameter :: metgribs = [Character(len=100) ::  &
+                                                            & "../Meteo/ecglob10deg_2021042600+002grib2.ml", &
+                                                            & "../Meteo/ecglob10deg_2021042600+002.lnsp", &
+                                                            & "../Meteo/ecglob10deg_2021042600+002.sfc" ]
 
   !
   ! Create and initialise a bunch of fires
@@ -28,7 +30,7 @@ program test_plume_rise
 
   call  acquire_fires(fires, frpgrib)
   call acquire_meteo(meteo_data, fires, metgribs)
-  stop 1
+  ! stop 1
 
 
   !
@@ -40,7 +42,7 @@ program test_plume_rise
   !
   ! Print the results
   !
-  
+  call store_plume_rise(fires, frpgrib, plumerisegrib) 
   
   
 end program test_plume_rise
